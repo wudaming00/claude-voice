@@ -1,4 +1,26 @@
-"""FastAPI server: HTTP page + WebSocket for voice turn I/O."""
+"""FastAPI server — HTTP entry point + WebSocket for voice/text turns.
+
+High-level flow of one voice turn
+---------------------------------
+1. The PWA front-end records Opus/WebM audio while the user holds the
+   push-to-talk button.
+2. On release it opens (or reuses) a WebSocket to ``/ws`` and sends:
+     - a JSON ``audio_start`` message with a fresh ``turn_id``
+     - one or more binary frames containing the audio bytes
+     - a JSON ``audio_end`` message
+3. This server buffers the bytes, feeds them to ``stt.transcribe`` (local
+   faster-whisper), then hands the transcript to ``claude_service.ClaudeService``.
+4. ``claude_service`` spawns ``claude -p --resume <session-id>`` and
+   streams JSON events back. Whenever a full sentence boundary is detected
+   in Claude's reply, it is pushed onto a TTS queue.
+5. A background worker pulls sentences off the queue and streams MP3 audio
+   chunks back to the browser via the same WebSocket, so Claude's voice
+   starts playing while it is still thinking about the rest of the reply.
+
+The session lives for the lifetime of the WebSocket connection. On
+reconnect the client can send a ``new_session`` message to start fresh;
+otherwise the same ``session_id`` is resumed so Claude keeps its context.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -25,6 +47,17 @@ FRONTEND_DIR = ROOT / "frontend"
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
+# System prompt appended to every voice-mode turn.
+#
+# Why it's needed: Claude's default output is markdown-heavy and can be
+# paragraphs long. Both are awful over TTS — asterisks become "asterisk
+# asterisk", code blocks get read character-by-character, and long
+# replies keep the user waiting. This prompt reshapes Claude's style
+# for speech: short spoken sentences, no markup, no URLs/paths, no
+# filler questions.
+#
+# It's only injected when ``mode == "voice"``. The text-mode toggle on
+# the front-end skips it so typed chat gets normal Claude behaviour.
 VOICE_MODE_PROMPT = (
     "You are speaking with the user through a voice interface. Your replies "
     "will be spoken aloud by text-to-speech. Follow these rules strictly:\n"
@@ -49,6 +82,10 @@ VOICE_MODE_PROMPT = (
 
 app = FastAPI(title="Claude Voice")
 
+# ClaudeService is a thin wrapper around the `claude` CLI — spawning a
+# subprocess per turn and parsing its streaming JSON output. We build it
+# once at startup from environment variables so every WebSocket
+# connection shares the same config.
 claude = ClaudeService(
     claude_bin=os.environ.get("CLAUDE_BIN") or None,
     default_cwd=os.environ.get("CLAUDE_CWD") or None,
@@ -64,25 +101,83 @@ async def index():
 
 @app.get("/favicon.ico")
 async def favicon():
+    # Browsers request /favicon.ico eagerly. Return the PWA icon so it
+    # shows up as the tab icon too, and fall back to 204 so we don't
+    # spam 404s in logs if the icon is missing.
     icon = FRONTEND_DIR / "icon-192.png"
     if icon.exists():
         return FileResponse(icon)
     return Response(status_code=204)
 
 
+# Serve the PWA assets (manifest, icons, JS, CSS) from /static.
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
-async def _send_json(ws: WebSocket, payload: dict) -> None:
-    await ws.send_text(json.dumps(payload, ensure_ascii=False))
+def _ws_alive(ws: WebSocket) -> bool:
+    """Cheap check before writing to a socket that might already be closed.
+
+    FastAPI/Starlette keeps two state fields: ``client_state`` is what the
+    browser has done, ``application_state`` is what we've done. Either
+    being non-CONNECTED means a write will either error or vanish, so we
+    short-circuit before attempting it. This prevents noisy tracebacks
+    when the user disconnects mid-turn.
+    """
+    return (
+        ws.client_state == WebSocketState.CONNECTED
+        and ws.application_state == WebSocketState.CONNECTED
+    )
+
+
+async def _send_json(ws: WebSocket, payload: dict) -> bool:
+    """Send JSON, swallowing disconnect errors.
+
+    Returns True on success, False if the peer is gone. We return a
+    boolean (rather than raising) because the caller usually wants to
+    abort the current turn cleanly, not propagate a cascade of
+    ``WebSocketDisconnect`` exceptions up the stack.
+    """
+    if not _ws_alive(ws):
+        return False
+    try:
+        # ``ensure_ascii=False`` is important for Chinese/Japanese/Korean
+        # content — we want real characters on the wire, not \uXXXX escapes.
+        await ws.send_text(json.dumps(payload, ensure_ascii=False))
+        return True
+    except (WebSocketDisconnect, RuntimeError):
+        return False
+
+
+async def _send_bytes(ws: WebSocket, data: bytes) -> bool:
+    """Binary counterpart of ``_send_json``. Same disconnect-swallowing contract."""
+    if not _ws_alive(ws):
+        return False
+    try:
+        await ws.send_bytes(data)
+        return True
+    except (WebSocketDisconnect, RuntimeError):
+        return False
 
 
 async def _speak_sentence(ws: WebSocket, text: str) -> None:
-    """Synthesize one sentence and push audio frames to the client."""
-    await _send_json(ws, {"type": "tts_start", "text": text})
+    """Synthesize one sentence and push audio frames to the client.
+
+    Protocol framing on the wire:
+        {"type": "tts_start", "text": "..."}   # lets the UI display the sentence
+        <binary MP3 chunk>, <binary MP3 chunk>, ...
+        {"type": "tts_end"}                    # the UI can mark this sentence done
+
+    If the client disconnects partway, we abort quietly — there's no
+    point finishing TTS for an audience that left. Exceptions from the
+    Edge TTS call are reported to the client as ``tts_error`` so the UI
+    can fall back to showing the text without blocking on audio.
+    """
+    if not await _send_json(ws, {"type": "tts_start", "text": text}):
+        return
     try:
         async for chunk in synthesize_stream(text):
-            await ws.send_bytes(chunk)
+            if not await _send_bytes(ws, chunk):
+                return
     except Exception as e:
         log.exception("TTS failed")
         await _send_json(ws, {"type": "tts_error", "message": str(e)})
@@ -92,11 +187,29 @@ async def _speak_sentence(ws: WebSocket, text: str) -> None:
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    """The only WebSocket route. Handles the full lifecycle of one client.
+
+    Message types accepted from the client:
+        hello        — initial handshake, optionally sets cwd and mode
+        set_mode     — toggle between voice and text mode mid-session
+        new_session  — discard the current Claude session and start fresh
+        audio_start  — begin a new voice turn (with a turn_id for dedup)
+        audio_end    — mark the end of a voice turn; trigger STT + Claude
+        text         — text-mode input (skip STT, go straight to Claude)
+        <binary>     — raw audio bytes (expected between audio_start/end)
+
+    The ``processed_turn_ids`` set defends against a browser bug that
+    sometimes fires ``audio_end`` twice for the same recording — without
+    dedup we would charge the user's subscription for the same transcript
+    twice and speak the same reply back to them.
+    """
     await ws.accept()
     session: Optional[Session] = None
     audio_buf = bytearray()
     audio_format = "webm"
     mode = "voice"  # "voice" or "text"
+    current_turn_id: Optional[str] = None
+    processed_turn_ids: set[str] = set()
 
     try:
         while True:
@@ -105,6 +218,10 @@ async def ws_endpoint(ws: WebSocket):
             msg = await ws.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
+
+            # WebSocket frames from Starlette come with either a "bytes"
+            # or "text" field set. Binary bytes are only ever audio, so
+            # just append and wait for the next JSON envelope.
             if "bytes" in msg and msg["bytes"] is not None:
                 audio_buf.extend(msg["bytes"])
                 continue
@@ -114,6 +231,8 @@ async def ws_endpoint(ws: WebSocket):
             try:
                 data = json.loads(msg["text"])
             except json.JSONDecodeError:
+                # Ignore malformed frames rather than disconnect — a client
+                # with a bug shouldn't be able to kill its own session.
                 continue
 
             mtype = data.get("type")
@@ -132,14 +251,31 @@ async def ws_endpoint(ws: WebSocket):
                 await _send_json(ws, {"type": "mode", "mode": mode})
 
             elif mtype == "new_session":
+                # Claude's context (files read, prior instructions) lives
+                # inside the subprocess's view of --resume <session-id>.
+                # Creating a new Session here forces the next turn to pass
+                # --session-id instead, giving Claude a clean slate.
                 session = claude.new_session(cwd=data.get("cwd"))
                 await _send_json(ws, {"type": "ready", "session_id": session.session_id, "cwd": session.cwd, "mode": mode})
 
             elif mtype == "audio_start":
                 audio_buf = bytearray()
                 audio_format = data.get("format", "webm")
+                current_turn_id = data.get("turn_id")
+                log.info("audio_start turn_id=%s format=%s", current_turn_id, audio_format)
 
             elif mtype == "audio_end":
+                incoming_turn_id = data.get("turn_id") or current_turn_id
+                log.info("audio_end turn_id=%s buf_bytes=%d", incoming_turn_id, len(audio_buf))
+
+                # Dedup duplicate audio_end frames (see set-up in docstring).
+                if incoming_turn_id and incoming_turn_id in processed_turn_ids:
+                    log.warning("dropping duplicate audio_end for turn_id=%s", incoming_turn_id)
+                    audio_buf = bytearray()
+                    continue
+
+                # Lazy session creation: a client that skips `hello` and
+                # jumps straight to audio still gets a working session.
                 if session is None:
                     session = claude.new_session()
                     await _send_json(ws, {"type": "ready", "session_id": session.session_id, "cwd": session.cwd, "mode": mode})
@@ -157,16 +293,31 @@ async def ws_endpoint(ws: WebSocket):
                     audio_buf = bytearray()
                     continue
 
+                # Always reset the buffer before processing the transcript.
+                # Otherwise a failed turn would concatenate with the next one
+                # and produce a garbled second attempt.
                 audio_buf = bytearray()
 
                 if not transcript:
                     await _send_json(ws, {"type": "error", "message": "empty transcript"})
                     continue
 
+                if incoming_turn_id:
+                    processed_turn_ids.add(incoming_turn_id)
+                    # Bound the dedup set. Clients don't replay turn IDs
+                    # arbitrarily far into the past, so forgetting the
+                    # oldest entries is safe. ``set.pop()`` removes an
+                    # arbitrary element which is fine for this purpose.
+                    if len(processed_turn_ids) > 64:
+                        processed_turn_ids.pop()
+
+                log.info("transcript turn_id=%s chars=%d", incoming_turn_id, len(transcript))
                 await _send_json(ws, {"type": "transcript", "text": transcript})
                 await _run_claude_turn(ws, session, transcript, mode)
 
             elif mtype == "text":
+                # Text mode skips STT entirely. Useful on a laptop, and for
+                # debugging without needing a working microphone.
                 if session is None:
                     session = claude.new_session()
                 prompt = (data.get("text") or "").strip()
@@ -179,6 +330,8 @@ async def ws_endpoint(ws: WebSocket):
         log.info("client disconnected")
     except Exception:
         log.exception("ws handler error")
+        # Best-effort error frame. If the socket is already gone this is
+        # a no-op thanks to the disconnect-swallowing helpers above.
         try:
             await _send_json(ws, {"type": "error", "message": "server error"})
         except Exception:
@@ -186,45 +339,87 @@ async def ws_endpoint(ws: WebSocket):
 
 
 async def _run_claude_turn(ws: WebSocket, session: Session, prompt: str, mode: str = "voice") -> None:
+    """Drive one turn through Claude and stream sentences back as they land.
+
+    Pipeline:
+        Claude CLI stdout (JSON events)
+            └─> sentence-boundary detector in claude_service
+                    └─> tts_queue (asyncio.Queue)
+                            └─> background tts_worker → _speak_sentence → WebSocket
+
+    The queue decouples Claude's text-production rate from Edge TTS's
+    audio-production rate. If Claude is faster (short sentences, network
+    cache hits) the queue fills briefly; if TTS is faster it drains. Either
+    way the user starts hearing audio within ~1 sentence of Claude starting
+    to speak.
+    """
     await _send_json(ws, {"type": "thinking"})
     tts_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
 
     async def tts_worker():
+        # Drain sentences sequentially. If the client has already
+        # disconnected we keep pulling from the queue but don't send, so
+        # the producer is never blocked by a dead consumer.
         while True:
             sentence = await tts_queue.get()
             if sentence is None:
                 return
+            if not _ws_alive(ws):
+                continue
             await _speak_sentence(ws, sentence)
 
     worker = asyncio.create_task(tts_worker())
     system_prompt = VOICE_MODE_PROMPT if mode == "voice" else None
+    claude_stream = claude.ask_stream(session, prompt, system_prompt=system_prompt)
 
-    try:
-        async for event in claude.ask_stream(session, prompt, system_prompt=system_prompt):
-            etype = event["type"]
-            if etype == "text_delta":
-                await _send_json(ws, {"type": "text_delta", "text": event["text"]})
-            elif etype == "sentence":
-                if mode == "voice":
-                    await tts_queue.put(event["text"])
-            elif etype == "tool_use":
-                await _send_json(ws, {"type": "tool_use", "name": event["name"]})
-            elif etype == "done":
-                await tts_queue.put(None)
-                await worker
-                await _send_json(ws, {"type": "done", "session_id": event["session_id"]})
-            elif etype == "error":
-                await tts_queue.put(None)
-                await worker
-                await _send_json(ws, {"type": "error", "message": event["message"]})
-    except Exception as e:
-        log.exception("turn failed")
+    async def stop_worker():
+        # Send a None sentinel so the worker exits its loop, then await
+        # it so the task is reaped cleanly (prevents "Task was destroyed
+        # but it is pending" warnings at shutdown).
         await tts_queue.put(None)
         try:
             await worker
         except Exception:
             pass
+
+    try:
+        async for event in claude_stream:
+            if not _ws_alive(ws):
+                log.info("client disconnected mid-turn, aborting stream")
+                break
+            etype = event["type"]
+            if etype == "text_delta":
+                # Forward the text delta so the UI can render Claude's
+                # reply incrementally. TTS runs off whole sentences only.
+                await _send_json(ws, {"type": "text_delta", "text": event["text"]})
+            elif etype == "sentence":
+                if mode == "voice":
+                    await tts_queue.put(event["text"])
+            elif etype == "tool_use":
+                # Surface tool use in the UI so the user can see Claude is
+                # doing something (e.g. "reading main.py") rather than
+                # staring at silence while Claude runs bash commands.
+                await _send_json(ws, {"type": "tool_use", "name": event["name"]})
+            elif etype == "done":
+                await stop_worker()
+                await _send_json(ws, {"type": "done", "session_id": event["session_id"]})
+            elif etype == "error":
+                await stop_worker()
+                await _send_json(ws, {"type": "error", "message": event["message"]})
+    except Exception as e:
+        log.exception("turn failed")
+        await stop_worker()
         await _send_json(ws, {"type": "error", "message": f"turn failed: {e}"})
+    finally:
+        # Defensive cleanup: even if the loop broke from an early return
+        # or exception, make sure the worker is stopped and the Claude
+        # subprocess is reaped. Otherwise repeated turns can leak both
+        # asyncio tasks and OS processes.
+        await stop_worker()
+        try:
+            await claude_stream.aclose()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

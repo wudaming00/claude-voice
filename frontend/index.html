@@ -14,9 +14,21 @@
   <header>
     <div class="title">Claude Voice</div>
     <div class="header-right">
-      <button id="mode-toggle" class="mode-toggle" data-mode="voice" title="Switch voice / text mode">
-        <span class="mode-icon">🎙️</span>
-        <span class="mode-label">Voice</span>
+      <button type="button" id="speaker-toggle" class="speaker-toggle on"
+              aria-label="Toggle voice output" aria-pressed="true"
+              title="Voice output">
+        <svg class="icon-on" viewBox="0 0 24 24" width="20" height="20" fill="none"
+             stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="currentColor"></polygon>
+          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+        </svg>
+        <svg class="icon-off" viewBox="0 0 24 24" width="20" height="20" fill="none"
+             stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="currentColor"></polygon>
+          <line x1="23" y1="9" x2="17" y2="15"></line>
+          <line x1="17" y1="9" x2="23" y2="15"></line>
+        </svg>
       </button>
       <div class="session" id="session">—</div>
     </div>
@@ -31,9 +43,20 @@
     <button id="ptt" class="ptt" disabled>
       <span class="ptt-label">Hold to talk</span>
     </button>
+    <form id="text-form" class="text-row" autocomplete="off">
+      <input id="text-input" type="text" placeholder="Or type a message…"
+             autocomplete="off" autocapitalize="sentences" />
+      <button type="submit" id="send-text" class="send-btn" aria-label="Send" disabled>
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+             stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="19" x2="12" y2="5"></line>
+          <polyline points="5 12 12 5 19 12"></polyline>
+        </svg>
+      </button>
+    </form>
     <div class="actions">
       <button id="new-session" class="secondary">New session</button>
-      <button id="stop-audio" class="secondary">Stop audio</button>
+      <button id="stop-audio" class="secondary hidden">Stop audio</button>
     </div>
   </footer>
 
