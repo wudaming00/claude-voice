@@ -60,6 +60,18 @@
     </div>
   </footer>
 
+  <div id="login-modal" class="login-modal hidden" aria-hidden="true">
+    <form id="login-form" class="login-card" autocomplete="on">
+      <div class="login-title">Claude Voice</div>
+      <div class="login-sub">Enter the server password</div>
+      <input id="login-password" type="password" name="password"
+             autocomplete="current-password" placeholder="Password"
+             enterkeyhint="go" autofocus />
+      <div id="login-error" class="login-error hidden"></div>
+      <button type="submit" id="login-submit" class="login-submit">Unlock</button>
+    </form>
+  </div>
+
   <script src="/static/app.js"></script>
 </body>
 </html>

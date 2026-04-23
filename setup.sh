@@ -290,6 +290,27 @@ if [ ! -f ".env" ]; then
     { print }
   ' .env > .env.tmp && mv .env.tmp .env
   ok "CLAUDE_CWD set to: $USER_CWD"
+
+  # Generate a strong random password. This is the default "safe when
+  # exposed over Tailscale Funnel / the public internet" configuration.
+  # If the user wants tailnet-only (no auth), they can blank this line in
+  # .env afterwards — we explain how in the printed message and in README.
+  echo
+  GENERATED_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(16))' 2>/dev/null || true)"
+  if [ -n "$GENERATED_PASSWORD" ]; then
+    awk -v pw="$GENERATED_PASSWORD" '
+      /^AUTH_PASSWORD=/ { print "AUTH_PASSWORD=" pw; next }
+      { print }
+    ' .env > .env.tmp && mv .env.tmp .env
+    say "A login password was generated for the PWA:"
+    printf "\n    %s%s%s\n\n" "$BOLD" "$GENERATED_PASSWORD" "$RESET"
+    say "You'll type it once on your phone; the browser remembers it after that."
+    say "Blank out AUTH_PASSWORD in .env if you only use the server over a"
+    say "trusted tailnet / LAN."
+  else
+    warn "Could not auto-generate AUTH_PASSWORD (python missing?). Set one"
+    warn "manually in .env before exposing the server publicly."
+  fi
 else
   ok ".env already exists — leaving your settings alone"
 fi

@@ -237,3 +237,68 @@ footer {
 }
 .send-btn:not(:disabled):active { transform: scale(0.92); }
 .send-btn:disabled { cursor: default; }
+
+/* Login modal — full-screen overlay shown before any app UI is useable. */
+.login-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(7, 9, 14, 0.92);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.login-modal.hidden { display: none; }
+
+.login-card {
+  width: 100%;
+  max-width: 320px;
+  background: #111520;
+  border: 1px solid #1f2533;
+  border-radius: 16px;
+  padding: 28px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+.login-title { font-size: 18px; font-weight: 600; text-align: center; }
+.login-sub   { font-size: 13px; color: #7c8494; text-align: center; }
+
+#login-password {
+  background: #0b0d12;
+  border: 1px solid #2a3142;
+  color: #e6e8ee;
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 16px; /* >=16px prevents iOS Safari auto-zoom on focus */
+  outline: none;
+  transition: border-color 0.15s ease;
+  -webkit-user-select: text;
+  user-select: text;
+}
+#login-password:focus { border-color: #3d78ff; }
+
+.login-error {
+  color: #ff6b7a;
+  font-size: 13px;
+  text-align: center;
+  min-height: 18px;
+}
+.login-error.hidden { display: none; }
+
+.login-submit {
+  background: linear-gradient(180deg, #3d78ff, #2055d4);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  border: none;
+  border-radius: 10px;
+  padding: 12px;
+  cursor: pointer;
+  transition: filter 0.15s ease;
+}
+.login-submit:active { filter: brightness(0.9); }
+.login-submit:disabled { opacity: 0.5; cursor: default; }

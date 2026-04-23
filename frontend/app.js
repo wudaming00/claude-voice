@@ -7,6 +7,7 @@
   // Constants
   // ---------------------------------------------------------------------------
   const MODE_KEY = 'claude-voice-mode';
+  const TOKEN_KEY = 'claude-voice-token';
 
   const MIN_RECORD_MS = 500;     // below this on release: treat as accidental tap and drop
   const CANCEL_SWIPE_PX = 80;    // drag up > this many px: cancel recording
@@ -32,12 +33,20 @@
   const textFormEl = document.getElementById('text-form');
   const textInputEl = document.getElementById('text-input');
   const sendTextBtn = document.getElementById('send-text');
+  const loginModalEl = document.getElementById('login-modal');
+  const loginFormEl = document.getElementById('login-form');
+  const loginPasswordEl = document.getElementById('login-password');
+  const loginErrorEl = document.getElementById('login-error');
+  const loginSubmitEl = document.getElementById('login-submit');
 
   // ---------------------------------------------------------------------------
   // State
   // ---------------------------------------------------------------------------
   let mode = localStorage.getItem(MODE_KEY) === 'text' ? 'text' : 'voice';
   let ws = null;
+  let authToken = localStorage.getItem(TOKEN_KEY) || '';
+  let authRequired = false;  // set from /auth/status on boot
+  let refreshTimer = null;
 
   // Recording state
   let mediaRecorder = null;
@@ -56,6 +65,9 @@
   let isPlayingAudio = false;
   let ttsCurrentChunks = [];
   let audioUnlocked = false;
+  // True between server `done` and the last queued audio finishing, so the
+  // UI transitions to Ready only after the user actually stops hearing Claude.
+  let doneWaitingForAudio = false;
 
   // Chat render state
   let assistantLiveEl = null;
@@ -156,7 +168,12 @@
     try { ttsAudio.removeAttribute('src'); ttsAudio.load(); } catch (_) {}
     revokeCurrentUrl();
     isPlayingAudio = false;
+    doneWaitingForAudio = false;
     updateStopAudioVisibility();
+    // If we were showing Speaking/Thinking because of TTS, release the UI.
+    if (/Speaking|Thinking/i.test(statusEl.textContent)) {
+      setStatus('Ready · hold to talk');
+    }
   }
 
   function updateStopAudioVisibility() {
@@ -205,10 +222,20 @@
     if (audioQueue.length === 0) {
       isPlayingAudio = false;
       updateStopAudioVisibility();
+      // Queue drained. If the turn already finished server-side, flip to
+      // Ready now (not when `done` arrived — audio is what the user hears).
+      // Otherwise Claude is still generating; show Thinking, not Speaking.
+      if (doneWaitingForAudio) {
+        doneWaitingForAudio = false;
+        setStatus('Ready · hold to talk');
+      } else if (/Speaking/i.test(statusEl.textContent)) {
+        setStatus('Thinking…');
+      }
       return;
     }
     isPlayingAudio = true;
     updateStopAudioVisibility();
+    setStatus('Speaking…');
 
     const blob = audioQueue.shift();
     revokeCurrentUrl();
@@ -230,7 +257,8 @@
   // ---------------------------------------------------------------------------
   function connectWS() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${proto}://${location.host}/ws`;
+    const qs = authToken ? `?token=${encodeURIComponent(authToken)}` : '';
+    const url = `${proto}://${location.host}/ws${qs}`;
     setStatus('Connecting…');
 
     ws = new WebSocket(url);
@@ -240,7 +268,17 @@
       setStatus('Connected');
       ws.send(JSON.stringify({ type: 'hello', mode }));
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
+      // 4401 = our application-level "bad token". Don't retry in a loop —
+      // prompt the user for the password and reconnect after they unlock.
+      if (ev && ev.code === 4401) {
+        authToken = '';
+        try { localStorage.removeItem(TOKEN_KEY); } catch (_) {}
+        setStatus('Locked — enter password');
+        pttEl.disabled = true;
+        showLoginModal('Session expired. Please sign in again.');
+        return;
+      }
       setStatus('Disconnected — retrying in 3s…');
       pttEl.disabled = true;
       setTimeout(connectWS, 3000);
@@ -284,8 +322,9 @@
         appendAssistantDelta(data.text);
         break;
       case 'tts_start':
+        // Don't flip status here — playback is what the user hears. playNext
+        // sets Speaking the moment it actually starts audio.
         ttsCurrentChunks = [];
-        setStatus('Speaking…');
         break;
       case 'tts_end':
         if (ttsCurrentChunks.length > 0) {
@@ -299,11 +338,20 @@
         break;
       case 'done':
         finalizeAssistant();
-        setStatus('Ready · hold to talk');
+        // If there's still audio queued or playing, wait for it to drain
+        // before showing Ready — otherwise the UI says "ready" while Claude
+        // is still audibly talking.
+        if (isPlayingAudio || audioQueue.length > 0) {
+          doneWaitingForAudio = true;
+        } else {
+          doneWaitingForAudio = false;
+          setStatus('Ready · hold to talk');
+        }
         break;
       case 'error':
         addMsg('assistant', `Error: ${data.message}`, 'error');
         finalizeAssistant();
+        doneWaitingForAudio = false;
         setStatus('Ready · hold to talk');
         break;
       default:
@@ -567,7 +615,177 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // Login modal
+  // ---------------------------------------------------------------------------
+  function showLoginModal(message) {
+    loginModalEl.classList.remove('hidden');
+    loginModalEl.setAttribute('aria-hidden', 'false');
+    if (message) {
+      loginErrorEl.textContent = message;
+      loginErrorEl.classList.remove('hidden');
+    } else {
+      loginErrorEl.textContent = '';
+      loginErrorEl.classList.add('hidden');
+    }
+    loginPasswordEl.value = '';
+    // Defer focus so the modal fade-in finishes first — iOS is picky about
+    // programmatic focus during transitions.
+    setTimeout(() => { try { loginPasswordEl.focus(); } catch (_) {} }, 50);
+  }
+
+  function hideLoginModal() {
+    loginModalEl.classList.add('hidden');
+    loginModalEl.setAttribute('aria-hidden', 'true');
+    loginErrorEl.textContent = '';
+    loginErrorEl.classList.add('hidden');
+  }
+
+  // Parse token expiry from the HMAC token format `<expires_at>.<hmac>`.
+  // Client-side only — the server still verifies the signature on every
+  // request, so a tampered token just fails validation.
+  function tokenExpiryMs(token) {
+    if (!token) return 0;
+    const dot = token.indexOf('.');
+    if (dot <= 0) return 0;
+    const exp = parseInt(token.slice(0, dot), 10);
+    return Number.isFinite(exp) ? exp * 1000 : 0;
+  }
+
+  function scheduleRefresh() {
+    if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+    if (!authToken) return;
+    const expMs = tokenExpiryMs(authToken);
+    if (!expMs) return;
+    // Refresh when <7d remain. setTimeout max is ~24.8 days, so clamp.
+    const REFRESH_BEFORE_MS = 7 * 24 * 3600 * 1000;
+    const delay = Math.min(
+      Math.max(expMs - Date.now() - REFRESH_BEFORE_MS, 60 * 1000),
+      20 * 24 * 3600 * 1000,
+    );
+    refreshTimer = setTimeout(refreshToken, delay);
+  }
+
+  async function refreshToken() {
+    if (!authToken) return;
+    try {
+      const r = await fetch('/auth/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: authToken }),
+      });
+      if (!r.ok) {
+        // Token is past the refresh window (expired). Wipe it so the next
+        // boot lands on the login modal instead of bouncing off the WS
+        // auth gate silently.
+        authToken = '';
+        try { localStorage.removeItem(TOKEN_KEY); } catch (_) {}
+        return;
+      }
+      const { token } = await r.json();
+      if (token) {
+        authToken = token;
+        try { localStorage.setItem(TOKEN_KEY, token); } catch (_) {}
+        scheduleRefresh();
+      }
+    } catch (_) {
+      // Transient network error — try again in 5 minutes. The WS layer
+      // will surface a persistent outage anyway.
+      refreshTimer = setTimeout(refreshToken, 5 * 60 * 1000);
+    }
+  }
+
+  async function exchangePasswordForToken(password) {
+    const r = await fetch('/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    if (!r.ok) {
+      let msg = 'Login failed';
+      try { const j = await r.json(); if (j && j.error) msg = j.error; } catch (_) {}
+      const err = new Error(msg);
+      err.status = r.status;
+      throw err;
+    }
+    const { token } = await r.json();
+    authToken = token;
+    try { localStorage.setItem(TOKEN_KEY, token); } catch (_) {}
+    scheduleRefresh();
+    return token;
+  }
+
+  loginFormEl.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const password = loginPasswordEl.value;
+    if (!password) return;
+    loginSubmitEl.disabled = true;
+    loginErrorEl.classList.add('hidden');
+    try {
+      await exchangePasswordForToken(password);
+      hideLoginModal();
+      connectWS();
+    } catch (err) {
+      loginErrorEl.textContent = err.message || 'Network error — try again.';
+      loginErrorEl.classList.remove('hidden');
+    } finally {
+      loginSubmitEl.disabled = false;
+    }
+  });
+
+  // ---------------------------------------------------------------------------
   // Kick off
   // ---------------------------------------------------------------------------
-  connectWS();
+  // Extract a login password handed to us in the URL hash, e.g.
+  // https://…/#login=XXXX. We use the hash (not a query param) so the
+  // password never hits server access logs or proxies. The QR code
+  // produced by `expose.sh` embeds this format, which is how the user
+  // avoids typing a 22-character password on their phone.
+  function consumeHashLogin() {
+    if (!location.hash) return '';
+    const m = /(?:^#|&)login=([^&]+)/.exec(location.hash);
+    if (!m) return '';
+    const pwd = decodeURIComponent(m[1]);
+    // Strip the hash immediately so a page reload or shared screenshot
+    // doesn't leak the password. ``replaceState`` avoids adding a history
+    // entry.
+    try {
+      const clean = location.pathname + location.search;
+      history.replaceState(null, '', clean);
+    } catch (_) {}
+    return pwd;
+  }
+
+  (async () => {
+    try {
+      const r = await fetch('/auth/status');
+      const j = await r.json();
+      authRequired = !!j.auth_required;
+    } catch (_) {
+      // If /auth/status is unreachable the server is likely down; let the
+      // usual WS reconnect loop surface the error instead of blocking here.
+      authRequired = false;
+    }
+
+    // If we arrived via a QR-code link and don't already have a valid
+    // token, redeem the embedded password silently. Failure falls through
+    // to the regular login modal so the user can try typing manually.
+    if (authRequired) {
+      const hashPwd = consumeHashLogin();
+      if (hashPwd && !authToken) {
+        try {
+          await exchangePasswordForToken(hashPwd);
+        } catch (err) {
+          showLoginModal(err.message || 'Auto-login failed.');
+          return;
+        }
+      }
+    }
+
+    if (authRequired && !authToken) {
+      showLoginModal();
+      return;
+    }
+    if (authRequired && authToken) scheduleRefresh();
+    connectWS();
+  })();
 })();

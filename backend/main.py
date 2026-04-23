@@ -30,11 +30,12 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
 
+from auth import Auth, AuthConfig, client_ip
 from claude_service import ClaudeService, Session
 from stt import transcribe
 from tts import synthesize_stream
@@ -93,6 +94,20 @@ claude = ClaudeService(
     permission_mode=os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions"),
 )
 
+auth_cfg = AuthConfig()
+auth = Auth(auth_cfg)
+
+if not auth_cfg.enabled and os.environ.get("HOST", "0.0.0.0") == "0.0.0.0":
+    # Belt-and-braces warning: if the server is bound to every interface
+    # AND auth is off, the operator almost certainly meant to set a
+    # password. A tailnet-only setup usually pairs with HOST=127.0.0.1 +
+    # a Tailscale Serve proxy, so this warning won't fire in that case.
+    log.warning(
+        "AUTH_PASSWORD is empty and HOST=0.0.0.0. Anyone who reaches this "
+        "server can drive Claude. Set AUTH_PASSWORD in .env, or bind to "
+        "127.0.0.1 and front it with Tailscale Serve."
+    )
+
 
 @app.get("/")
 async def index():
@@ -112,6 +127,56 @@ async def favicon():
 
 # Serve the PWA assets (manifest, icons, JS, CSS) from /static.
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+
+@app.get("/auth/status")
+async def auth_status():
+    """Tell the front-end whether to show a login gate.
+
+    We only expose the boolean, never the password. The client uses this
+    to decide whether to render the login modal on first load; if auth
+    is disabled the modal is skipped entirely.
+    """
+    return {"auth_required": auth_cfg.enabled}
+
+
+@app.post("/auth/login")
+async def auth_login(request: Request):
+    ip = client_ip(request)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    password = (data.get("password") if isinstance(data, dict) else "") or ""
+    token, err = auth.login(ip, password)
+    if err:
+        log.warning("login failed from %s", ip)
+        return JSONResponse({"error": err}, status_code=401)
+    return {"token": token, "ttl_seconds": auth_cfg.token_ttl_seconds}
+
+
+@app.post("/auth/refresh")
+async def auth_refresh(request: Request):
+    """Exchange a still-valid token for a fresh one with a full TTL.
+
+    The client calls this when the existing token's remaining life drops
+    below ``refresh_window_seconds`` (currently 7 days). As long as the
+    user keeps opening the PWA every 23 days their token treadmills
+    forward and they never see the login screen. Expired tokens are
+    refused — the 30-day ceiling is a feature.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    old_token = (data.get("token") if isinstance(data, dict) else "") or ""
+    new_token = auth.refresh_token(old_token)
+    if not new_token:
+        return JSONResponse(
+            {"error": "Token expired or invalid — please log in again."},
+            status_code=401,
+        )
+    return {"token": new_token, "ttl_seconds": auth_cfg.token_ttl_seconds}
 
 
 def _ws_alive(ws: WebSocket) -> bool:
@@ -203,6 +268,19 @@ async def ws_endpoint(ws: WebSocket):
     dedup we would charge the user's subscription for the same transcript
     twice and speak the same reply back to them.
     """
+    # Auth gate: accept the handshake first so we can close with a custom
+    # 4401 application code that the browser actually surfaces (browsers
+    # collapse pre-accept rejections into a generic 1006, making it
+    # indistinguishable from a network blip and breaking the "bad token →
+    # show login modal" branch on the client).
+    if auth_cfg.enabled:
+        token = ws.query_params.get("token")
+        if not auth.validate_token(token):
+            log.info("ws rejected: bad/missing token from %s", client_ip(ws))
+            await ws.accept()
+            await ws.close(code=4401, reason="unauthorized")
+            return
+
     await ws.accept()
     session: Optional[Session] = None
     audio_buf = bytearray()
