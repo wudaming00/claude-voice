@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#0b0d12" />
+  <link rel="manifest" href="/static/manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="/static/icon.svg" />
+  <link rel="apple-touch-icon" href="/static/icon-192.png" />
+  <title>Claude Voice</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header>
+    <div class="title">Claude Voice</div>
+    <div class="header-right">
+      <button id="mode-toggle" class="mode-toggle" data-mode="voice" title="Switch voice / text mode">
+        <span class="mode-icon">🎙️</span>
+        <span class="mode-label">Voice</span>
+      </button>
+      <div class="session" id="session">—</div>
+    </div>
+  </header>
+
+  <main>
+    <div id="log" class="log"></div>
+  </main>
+
+  <footer>
+    <div id="status" class="status">Initializing…</div>
+    <button id="ptt" class="ptt" disabled>
+      <span class="ptt-label">Hold to talk</span>
+    </button>
+    <div class="actions">
+      <button id="new-session" class="secondary">New session</button>
+      <button id="stop-audio" class="secondary">Stop audio</button>
+    </div>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
