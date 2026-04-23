@@ -44,24 +44,15 @@ One FastAPI process hosts the PWA, runs Whisper locally, shells out to the `clau
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/claude-voice.git
+git clone https://github.com/wudaming00/claude-voice.git
 cd claude-voice
-
-# 1. Python environment
-python3 -m venv .venv
-source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-# 2. Config
-cp .env.example .env
-#   → edit CLAUDE_CWD to point at the project you want Claude to work in.
-#   → leave CLAUDE_BIN blank to auto-discover `claude`.
-
-# 3. Run
-./run.sh
+./setup.sh       # creates .venv, installs deps, generates AUTH_PASSWORD
+./start.sh       # runs the server, opens a cloudflared tunnel, prints the login QR
 ```
 
-Open `http://127.0.0.1:7878/` **on the same machine**. Press and hold the blue button, talk, release. Localhost is the only plain-HTTP origin browsers allow microphone access from — to use it from your phone, see the next section.
+`./start.sh` leaves the process attached to your terminal; scan the QR from your phone and you're in. Ctrl+C stops the server and tunnel together.
+
+If you prefer to run things by hand or want a stable Tailscale URL instead of a random cloudflared one, see [Using it from your phone](#using-it-from-your-phone) below.
 
 ## Using it from your phone
 
@@ -78,10 +69,19 @@ That script installs-checks Tailscale, provisions a cert, opens a Funnel on port
 ### Cloudflare Tunnel (no account needed, one-shot URL)
 
 ```bash
-cloudflared tunnel --url http://127.0.0.1:7878
+./start.sh
 ```
 
-Prints a random `*.trycloudflare.com` URL. Add that URL to `.env` as `PUBLIC_URL=https://...` and then run `./expose.sh qr` to get the login QR pointing at it. The URL changes every time `cloudflared` restarts, so this is best for one-off testing.
+That starts the server, opens a `cloudflared` tunnel, parses the random `*.trycloudflare.com` URL out of its logs, writes it to `.env` as `PUBLIC_URL`, prints the login QR, and stays in the foreground. Ctrl+C cleans everything up. The URL changes every time `cloudflared` restarts, which is why this is the "testing from my phone right now" path rather than the long-term deployment path.
+
+If you'd rather drive the pieces by hand:
+
+```bash
+./run.sh &                                           # terminal 1
+cloudflared tunnel --url http://127.0.0.1:7878 &     # terminal 2, note the URL it prints
+# edit .env: PUBLIC_URL=https://<that-url>
+./expose.sh qr                                       # prints the QR
+```
 
 ### Self-signed HTTPS
 
