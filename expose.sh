@@ -273,9 +273,13 @@ if [ "${1:-}" = "off" ]; then
     warn "Tailscale isn't installed — nothing to tear down."
     exit 0
   fi
-  say "Disabling funnel + serve on port 443..."
-  sudo tailscale funnel --https=443 off >/dev/null 2>&1 || true
-  sudo tailscale serve  --https=443 off >/dev/null 2>&1 || true
+  say "Disabling funnel + serve..."
+  # Tailscale 1.70+ uses `reset`; the older `--https=443 off` form is
+  # still accepted on 1.60 but we try `reset` first so either works.
+  sudo tailscale funnel reset >/dev/null 2>&1 \
+    || sudo tailscale funnel --https=443 off >/dev/null 2>&1 || true
+  sudo tailscale serve  reset >/dev/null 2>&1 \
+    || sudo tailscale serve  --https=443 off >/dev/null 2>&1 || true
   ok "Claude Voice is no longer publicly exposed."
   exit 0
 fi
@@ -333,14 +337,18 @@ say "Provisioning TLS cert (this is a no-op if one already exists)..."
 sudo tailscale cert "$DNS_NAME" >/dev/null
 ok "Certificate ready for $DNS_NAME"
 
-# 5 + 6. Serve + Funnel
+# 5 + 6. Funnel (HTTPS on :443 → local port)
+#
+# Tailscale 1.70+ collapsed ``serve --https=443 <target>`` +
+# ``funnel --bg 443`` into a single ``funnel --bg <target>`` form. The
+# old syntax on new versions quietly mis-parses (``--https=443`` is read
+# as the target, leaving the actual URL floating). We reset first so a
+# prior mis-configured state is wiped cleanly, then issue the one-liner.
 say "Routing https://$DNS_NAME → http://127.0.0.1:$PORT"
-sudo tailscale serve --bg --https=443 "http://127.0.0.1:$PORT" >/dev/null
-ok "Tailscale serve is running"
-
-say "Opening funnel on 443 (public internet)..."
-sudo tailscale funnel --bg 443 >/dev/null
-ok "Funnel is open"
+sudo tailscale funnel reset >/dev/null 2>&1 || true
+sudo tailscale serve  reset >/dev/null 2>&1 || true
+sudo tailscale funnel --bg "http://127.0.0.1:$PORT" >/dev/null
+ok "Funnel is open on :443"
 
 # ---------------------------------------------------------------------------
 # Final step: print URL + login QR
