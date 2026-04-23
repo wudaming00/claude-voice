@@ -1,8 +1,10 @@
+<p align="center">
+  <img src="frontend/icon.svg" alt="Claude Voice" width="96" height="96">
+</p>
+
 # Claude Voice
 
 Hands-free voice interface for **Claude Code**, billed to your **Max subscription** (not API credits). Hold a button on your phone, speak, hear Claude reply — all round-trip streamed, with per-sentence TTS so Claude starts talking before it's finished thinking.
-
-![Claude Voice icon](frontend/icon.svg)
 
 - Talk to Claude while driving, cooking, walking — or just when you don't want to type.
 - Uses your existing Claude Code subscription (via the `claude` CLI), so no extra API bill.
