@@ -83,6 +83,10 @@ cloudflared tunnel --url http://127.0.0.1:7878 &     # terminal 2, note the URL 
 ./expose.sh qr                                       # prints the QR
 ```
 
+### Running as a service (auto-start on boot)
+
+If you want Claude Voice to come back up after reboots without someone typing anything, see [docs/autostart.md](docs/autostart.md) for systemd / WSL2 / launchd templates. Pair it with Tailscale, not `cloudflared` — random tunnel URLs don't survive a reboot.
+
 ### Self-signed HTTPS
 
 If you're on a LAN you trust and don't want a tunnel, you can run any local HTTPS terminator (Caddy, nginx, `mkcert` + a tiny proxy) and accept the cert on your phone. Details out of scope here.
