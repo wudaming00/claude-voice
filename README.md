@@ -43,6 +43,16 @@ One FastAPI process hosts the PWA, runs Whisper locally, shells out to the `clau
 
 ## Quick start
 
+### The laziest path — have Claude Code install it for you
+
+Open a `claude` session on the machine you want to host on, and paste:
+
+> Install Claude Voice from https://github.com/wudaming00/claude-voice on this machine. Clone it into my home directory, run setup.sh, then start.sh. Help me through any sudo prompts, Tailscale login, and phone QR scanning. Once the service is up, install the systemd unit from docs/autostart.md so it survives reboots.
+
+Claude Code will read this README, drive `setup.sh` / `start.sh` / `expose.sh` for you, and tell you the exact spots where you need to type a sudo password or open a browser. It's the first-install flow, verbatim, but with a human-readable assistant instead of a 6-step list.
+
+### The manual path
+
 ```bash
 git clone https://github.com/wudaming00/claude-voice.git
 cd claude-voice
@@ -52,7 +62,7 @@ cd claude-voice
 
 `./start.sh` leaves the process attached to your terminal; scan the QR from your phone and you're in. Ctrl+C stops the server and tunnel together.
 
-If you prefer to run things by hand or want a stable Tailscale URL instead of a random cloudflared one, see [Using it from your phone](#using-it-from-your-phone) below.
+If you want a stable Tailscale URL instead of a random cloudflared one, or want the server running as a system service, see [Using it from your phone](#using-it-from-your-phone) and [docs/autostart.md](docs/autostart.md).
 
 ## Using it from your phone
 
@@ -215,6 +225,12 @@ PRs welcome — see [Contributing](#contributing).
 **Locked out — the PWA keeps rejecting the password** — you've triggered the 5-strikes lockout. Wait 15 minutes (the message tells you how long) or clear it by restarting the server. To avoid typing mistakes entirely, use the QR flow: `./expose.sh qr` prints it fresh.
 
 **"AUTH_PASSWORD is empty" warning on startup** — either set one (`./expose.sh rotate` will generate one and restart for you) or bind to `HOST=127.0.0.1` if you're deliberately tailnet-only.
+
+**Phone can't load the Tailscale URL on home Wi-Fi, but it works on mobile data** — your router or ISP is blocking / rewriting DNS for `*.ts.net`. On the phone, set a custom DNS on that Wi-Fi network (`1.1.1.1`, `8.8.8.8`) or change the router's upstream DNS to a public resolver. Nothing to fix on the server side.
+
+**iOS "Add to Home Screen" app asks me to sign in again** — Safari and the PWA launched from the home screen live in separate storage sandboxes, so the token you acquired in Safari isn't visible to the home-screen instance. Enter the password once inside the home-screen app (or re-scan the QR) and it'll stay signed in there for 30 days.
+
+**Tailscale Funnel returns 502 Bad Gateway right after `./expose.sh`** — you're on Tailscale 1.70+ and ran a pre-1.70 version of `expose.sh`. The CLI syntax changed (see `git log expose.sh` for the fix). Run `sudo tailscale funnel reset && sudo tailscale serve reset`, then re-run `./expose.sh` from the current repo.
 
 ## Contributing
 
