@@ -205,6 +205,13 @@ class ClaudeService:
             # DEVNULL stdin so the CLI can't ever block waiting for input
             # (it shouldn't, given -p, but belt-and-braces).
             stdin=asyncio.subprocess.DEVNULL,
+            # Default StreamReader limit is 64KB/line, but Claude Code's
+            # stream-json emits one JSON event per line and a single event
+            # (e.g. a tool_use result containing a large file, or a long
+            # assistant message) can easily exceed that — hitting the
+            # default throws LimitOverrunError ("Separator is found, but
+            # chunk is longer than limit") and kills the whole turn.
+            limit=16 * 1024 * 1024,
         )
 
         # ``buffer`` accumulates text deltas until we spot a sentence
