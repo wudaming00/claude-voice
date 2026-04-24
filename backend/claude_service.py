@@ -50,7 +50,11 @@ def _discover_claude_bin() -> str:
     """Find the ``claude`` executable.
 
     Precedence (mirrored in ``setup.sh`` so the two agree):
-      1. ``CLAUDE_BIN`` env var — explicit override wins, no questions asked.
+      1. ``CLAUDE_BIN`` env var — explicit override wins *if the file exists*.
+         If it's set but points at a missing file (common after a VS Code
+         extension auto-upgrade rotates the versioned path under it), we warn
+         and fall through to auto-discovery rather than crash with errno 2
+         every turn.
       2. ``claude`` on ``PATH`` — recommended install path
          (``npm install -g @anthropic-ai/claude-code``).
       3. A VS Code / Cursor extension bundle — the editor ships its own copy
@@ -59,7 +63,13 @@ def _discover_claude_bin() -> str:
     """
     explicit = os.environ.get("CLAUDE_BIN")
     if explicit:
-        return explicit
+        if os.path.isfile(explicit):
+            return explicit
+        log.warning(
+            "CLAUDE_BIN=%s does not exist (VS Code extension upgraded?); "
+            "falling back to auto-discovery",
+            explicit,
+        )
 
     on_path = shutil.which("claude")
     if on_path:

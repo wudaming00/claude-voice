@@ -208,6 +208,8 @@ PRs welcome — see [Contributing](#contributing).
 
 **"Could not find the `claude` executable"** — run `npm install -g @anthropic-ai/claude-code` and `claude login`. If you insist on using the VS Code extension binary, point `CLAUDE_BIN` to its full path (version number included).
 
+**Every turn fails with `FileNotFoundError: [Errno 2]` / `claude exited with code -2`** — you pinned `CLAUDE_BIN` to a versioned VS Code extension path (e.g. `…/anthropic.claude-code-2.1.117-linux-x64/…`) and the extension has since auto-upgraded, deleting that directory. The backend now detects this at startup, warns, and falls back to auto-discovery — but to silence the warning, blank out `CLAUDE_BIN` in `.env` so it always picks the newest installed version.
+
 **Mic permission denied on phone** — you're on HTTP, not HTTPS. Use Tailscale Funnel or `cloudflared`.
 
 **Whisper first-time download is slow** — `large-v3` is ~3 GB. It caches; subsequent starts are instant. If you don't have the bandwidth or disk, set `WHISPER_MODEL=small` in `.env`.
