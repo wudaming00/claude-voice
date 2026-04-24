@@ -8,3 +8,7 @@ __pycache__/
 .idea/
 .vscode/
 *.egg-info/
+
+# Tailscale Funnel certs fetched by ./expose.sh — machine-specific, never commit
+*.ts.net.crt
+*.ts.net.key
