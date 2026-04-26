@@ -20,6 +20,8 @@ import asyncio
 import io
 import logging
 import os
+import threading
+import time
 from typing import Optional
 
 from faster_whisper import WhisperModel
@@ -27,6 +29,50 @@ from faster_whisper import WhisperModel
 log = logging.getLogger("claude_voice.stt")
 
 _MODEL: Optional[WhisperModel] = None
+_MODEL_LOCK = threading.Lock()
+_LAST_USED_TS: float = 0.0
+_IDLE_UNLOAD_SEC = float(os.environ.get("WHISPER_IDLE_UNLOAD_SEC", "300"))  # 5 min default
+_UNLOAD_THREAD_STARTED = False
+
+
+def _start_idle_unload_thread() -> None:
+    """Background thread that unloads the model + clears CUDA cache when idle.
+
+    Why: large-v3 sits on ~10GB VRAM permanently after first request, blocking
+    other GPU workloads on the same machine. Five minutes of inactivity is a
+    reasonable signal that no one is actively using voice-mode right now —
+    pay the ~10s reload cost when they come back.
+
+    Lower WHISPER_IDLE_UNLOAD_SEC (or set to 0 to disable) for chatty users.
+    """
+    global _UNLOAD_THREAD_STARTED
+    if _UNLOAD_THREAD_STARTED or _IDLE_UNLOAD_SEC <= 0:
+        return
+    _UNLOAD_THREAD_STARTED = True
+
+    def _loop():
+        global _MODEL, _LAST_USED_TS
+        while True:
+            time.sleep(60)  # check minute-resolution; nothing time-critical
+            with _MODEL_LOCK:
+                if _MODEL is None or _LAST_USED_TS == 0:
+                    continue
+                idle = time.time() - _LAST_USED_TS
+                if idle < _IDLE_UNLOAD_SEC:
+                    continue
+                log.info("Whisper idle for %.0fs (>= %.0fs) — unloading to free VRAM",
+                         idle, _IDLE_UNLOAD_SEC)
+                _MODEL = None
+            # Clear CUDA cache outside the lock so we don't block transcribe calls
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    t = threading.Thread(target=_loop, daemon=True, name="whisper-idle-unload")
+    t.start()
 
 # Prime Whisper with common technical vocabulary.
 #
@@ -49,8 +95,14 @@ DEFAULT_INITIAL_PROMPT = os.environ.get(
 )
 
 
+class WhisperDisabledError(RuntimeError):
+    """Raised when local STT is disabled by config — front-end should fall back
+    to OS-level speech input (iOS keyboard mic, Android Gboard voice typing,
+    macOS Dictation) which produces text directly into the chat input."""
+
+
 def _get_model() -> WhisperModel:
-    """Return the shared WhisperModel, loading it on first call.
+    """Return the shared WhisperModel, loading it on first call (or after idle-unload).
 
     Loading is deliberately done on the first real request rather than at
     import time so that:
@@ -58,17 +110,35 @@ def _get_model() -> WhisperModel:
       - Startup of the FastAPI server isn't blocked by a multi-second load
       - If the user never speaks (text-mode only), they never pay the
         load cost at all.
+
+    After WHISPER_IDLE_UNLOAD_SEC of inactivity the background thread sets
+    _MODEL = None; the next call here re-loads. ~10s reload cost vs 10GB
+    VRAM held idle 24/7 — usually a fair trade on a shared GPU.
+
+    Set WHISPER_ENABLED=0 to disable local STT entirely — useful when the GPU
+    is needed for other workloads and the user is happy using OS keyboard
+    voice input (iOS dictation / Android Gboard voice / macOS Dictation),
+    which is comparable in quality and runs on-device for free.
     """
-    global _MODEL
-    if _MODEL is None:
-        # Knobs are read once, so changing them after the first
-        # transcription requires a server restart. Worth the simplicity.
-        size = os.environ.get("WHISPER_MODEL", "large-v3")
-        device = os.environ.get("WHISPER_DEVICE", "auto")
-        compute_type = os.environ.get("WHISPER_COMPUTE", "float16")
-        log.info("Loading whisper model size=%s device=%s compute=%s", size, device, compute_type)
-        _MODEL = WhisperModel(size, device=device, compute_type=compute_type)
-    return _MODEL
+    if os.environ.get("WHISPER_ENABLED", "1") == "0":
+        raise WhisperDisabledError(
+            "Local Whisper is disabled (WHISPER_ENABLED=0). "
+            "Use your OS keyboard's voice input to dictate text instead."
+        )
+    global _MODEL, _LAST_USED_TS
+    _start_idle_unload_thread()  # idempotent — starts once
+    with _MODEL_LOCK:
+        if _MODEL is None:
+            # Default 'medium' (~3GB) instead of large-v3 (~10GB) — short
+            # voice turns rarely benefit from large-v3's accuracy gain;
+            # users with strong opinions can override via WHISPER_MODEL=large-v3.
+            size = os.environ.get("WHISPER_MODEL", "medium")
+            device = os.environ.get("WHISPER_DEVICE", "auto")
+            compute_type = os.environ.get("WHISPER_COMPUTE", "float16")
+            log.info("Loading whisper model size=%s device=%s compute=%s", size, device, compute_type)
+            _MODEL = WhisperModel(size, device=device, compute_type=compute_type)
+        _LAST_USED_TS = time.time()
+        return _MODEL
 
 
 def _transcribe_sync(audio_bytes: bytes, language: Optional[str]) -> str:

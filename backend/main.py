@@ -366,8 +366,19 @@ async def ws_endpoint(ws: WebSocket):
                 try:
                     transcript = await transcribe(bytes(audio_buf), language=data.get("language") or None)
                 except Exception as e:
-                    log.exception("STT failed")
-                    await _send_json(ws, {"type": "error", "message": f"STT failed: {e}"})
+                    # Distinguish disabled-by-config vs real failure so the front-end
+                    # can prompt user to use OS keyboard voice input instead.
+                    from stt import WhisperDisabledError
+                    if isinstance(e, WhisperDisabledError):
+                        log.info("STT request received but disabled — instructing user to use OS keyboard voice input")
+                        await _send_json(ws, {
+                            "type": "error",
+                            "code": "stt_disabled",
+                            "message": "本地语音识别已关闭。请用键盘的麦克风按钮(iOS 听写 / Gboard 语音输入)说话,文字会出现在输入框,然后点发送即可。",
+                        })
+                    else:
+                        log.exception("STT failed")
+                        await _send_json(ws, {"type": "error", "message": f"STT failed: {e}"})
                     audio_buf = bytearray()
                     continue
 
