@@ -372,7 +372,145 @@
     return mediaStream;
   }
 
-  async function actuallyStartRecording() {
+  // ---------------------------------------------------------------------------
+  // Web Speech API: prefer in-browser SpeechRecognition (iOS Safari uses Apple
+  // dictation, Android Chrome uses Google ASR, Desktop Chrome has its own).
+  // Quality is comparable to whisper-medium for short voice turns and runs
+  // entirely on-device — no GPU, no network upload of audio.
+  //
+  // Falls back to MediaRecorder + server-side STT only if SpeechRecognition
+  // isn't available (some Firefox builds, very old Safari).
+  // ---------------------------------------------------------------------------
+  const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const SR_AVAILABLE = !!SpeechRecognitionImpl;
+  let speechRec = null;
+  let speechFinalText = '';
+  let speechInterimText = '';
+
+  function detectSpeechLang() {
+    // Best-effort guess from page/system. UI is fine in zh; prefer zh-CN.
+    const browserLang = (navigator.language || 'zh-CN').toLowerCase();
+    if (browserLang.startsWith('zh')) return 'zh-CN';
+    if (browserLang.startsWith('en')) return 'en-US';
+    return browserLang;
+  }
+
+  async function actuallyStartRecording_SR() {
+    if (!ws || ws.readyState !== 1) {
+      setStatus('Not connected yet');
+      return false;
+    }
+
+    try {
+      // SpeechRecognition triggers its own permission prompt on iOS, but we
+      // also need mic stream warmed up for some browsers. Cheap to call.
+      await ensureMicStream();
+    } catch (err) {
+      console.error(err);
+      setStatus('Microphone permission denied');
+      return false;
+    }
+
+    speechFinalText = '';
+    speechInterimText = '';
+    speechRec = new SpeechRecognitionImpl();
+    speechRec.continuous = true;
+    speechRec.interimResults = true;
+    speechRec.lang = detectSpeechLang();
+
+    speechRec.onresult = (event) => {
+      let finalAdd = '';
+      let interim = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const r = event.results[i];
+        if (r.isFinal) {
+          finalAdd += r[0].transcript;
+        } else {
+          interim += r[0].transcript;
+        }
+      }
+      if (finalAdd) speechFinalText += finalAdd;
+      speechInterimText = interim;
+      // Live preview in status line
+      const preview = (speechFinalText + speechInterimText).trim().slice(-40);
+      if (preview) setStatus('🎤 ' + preview, 'recording');
+    };
+
+    speechRec.onerror = (event) => {
+      console.warn('SpeechRecognition error:', event.error);
+      // 'no-speech' / 'aborted' are harmless for press-to-talk; show real ones.
+      if (event.error && event.error !== 'aborted' && event.error !== 'no-speech') {
+        setStatus('Voice error: ' + event.error);
+      }
+    };
+
+    speechRec.onend = () => {
+      // onend fires when stop() is called OR after auto-cutoff. We rely on
+      // pointerup to handle send; this is just cleanup.
+      speechRec = null;
+    };
+
+    try {
+      speechRec.start();
+    } catch (err) {
+      console.error('SpeechRecognition.start failed:', err);
+      setStatus('Could not start voice recognition');
+      speechRec = null;
+      return false;
+    }
+
+    recordingStarted = true;
+    recordingStartMs = Date.now();
+    pttEl.classList.add('recording');
+    pttLabelEl.textContent = 'Release to send · swipe up to cancel';
+    setStatus('🎤 Listening…', 'recording');
+    vibrate(30);
+    return true;
+  }
+
+  function finishRecording_SR() {
+    const sr = speechRec;
+    speechRec = null;
+    recordingStarted = false;
+    pttEl.classList.remove('recording', 'cancel-zone');
+    pttLabelEl.textContent = 'Hold to talk';
+
+    if (sr) {
+      try { sr.stop(); } catch (_) {}
+    }
+
+    if (cancelRequested) {
+      setStatus('Cancelled');
+      return;
+    }
+
+    const duration = Date.now() - recordingStartMs;
+    if (duration < MIN_RECORD_MS) {
+      setStatus('Too short — hold longer');
+      vibrate(40);
+      return;
+    }
+
+    // Wait briefly for any trailing final result still in the pipeline.
+    setTimeout(() => {
+      const text = (speechFinalText + speechInterimText).trim();
+      if (!text) {
+        setStatus('No speech detected — try again');
+        vibrate(40);
+        return;
+      }
+      // Send as text turn — backend treats this exactly like typed input.
+      const turnId = makeTurnId();
+      ws.send(JSON.stringify({ type: 'text', content: text, turn_id: turnId }));
+      setStatus('Sent: ' + text.slice(0, 40), 'processing');
+    }, 250);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Legacy MediaRecorder path — only used as fallback when SpeechRecognition
+  // isn't available in the browser (rare, mostly old Firefox).
+  // ---------------------------------------------------------------------------
+  async function actuallyStartRecording_Legacy() {
     if (!ws || ws.readyState !== 1) {
       setStatus('Not connected yet');
       return false;
@@ -440,7 +578,7 @@
     return true;
   }
 
-  function finishRecording() {
+  function finishRecording_Legacy() {
     const wasRecording = mediaRecorder && mediaRecorder.state === 'recording';
     if (wasRecording) mediaRecorder.stop();
 
@@ -451,6 +589,19 @@
     if (wasRecording && !cancelRequested) {
       setStatus('Processing…', 'processing');
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dispatch: prefer in-browser SpeechRecognition; fall back to MediaRecorder.
+  // ---------------------------------------------------------------------------
+  async function actuallyStartRecording() {
+    if (SR_AVAILABLE) return actuallyStartRecording_SR();
+    return actuallyStartRecording_Legacy();
+  }
+
+  function finishRecording() {
+    if (SR_AVAILABLE) return finishRecording_SR();
+    return finishRecording_Legacy();
   }
 
   // ---------------------------------------------------------------------------
